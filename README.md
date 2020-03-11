@@ -188,7 +188,7 @@ name) instead of `ntoskrnl_vuln.exe` (IDB name).
 
 The Qt Creator debugging frontend changes the way gdb command output is logged. Since
 this would interfere with the synchronization an option exists to use the raw gdb output
-for synchronization instead of a temporary file. In the .sync configuration file use
+for synchronization instead of a temporary file. In the `.sync` configuration file use
 
 ```
 [GENERAL]
