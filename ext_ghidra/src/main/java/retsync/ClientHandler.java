@@ -70,6 +70,7 @@ public class ClientHandler implements Runnable {
                 plugin.clrs.cbColorFinal();
             }
         } finally {
+            plugin.clrs.stopEnhancedDecompHighlight();
             plugin.uiComponent.resetClient();
         }
     }
@@ -84,6 +85,10 @@ public class ClientHandler implements Runnable {
     }
 
     public void sendCmd(String cmd, String args) {
+        sendCmd(cmd, args, false);
+    }
+
+    public void sendCmd(String cmd, String args, boolean oneshot) {
         String cmd_op;
 
         if (dialect == null) {
@@ -96,6 +101,9 @@ public class ClientHandler implements Runnable {
 
             if (!args.isEmpty())
                 cmd_op = String.format("%s %s", cmd_op, args);
+
+            if (oneshot && dialect.containsKey("oneshot_post"))
+                cmd_op = String.format("%s%s", cmd_op, dialect.get("oneshot_post"));
 
             out.println(cmd_op);
         } else {

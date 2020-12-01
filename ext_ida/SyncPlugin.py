@@ -33,35 +33,26 @@ import base64
 import socket
 import json
 import uuid
-
-try:
-    from ConfigParser import SafeConfigParser
-except ImportError:
-    from configparser import ConfigParser as SafeConfigParser
+import argparse
 
 from retsync.syncrays import Syncrays
 import retsync.rsconfig as rsconfig
-from retsync.rsconfig import rs_encode, rs_decode, rs_log, rs_debug
+from retsync.rsconfig import rs_encode, rs_decode, rs_log, rs_debug, load_configuration
 
-try:
-    import argparse
-except ImportError:
-    rs_log("[-] please make sure python's argparse module is available\n%s" % repr(sys.exc_info()))
-    raise
-
-try:
-    from PyQt5 import QtCore, QtWidgets
-    from PyQt5.QtCore import QProcess, QProcessEnvironment
-except ImportError:
-    rs_log("[-] failed to import Qt libs from PyQt5\n%s" % repr(sys.exc_info()))
-    raise
+from PyQt5 import QtCore, QtWidgets
+from PyQt5.QtCore import QProcess, QProcessEnvironment
 
 import idc
 import idaapi
 import idautils
+import ida_bytes
 import ida_graph
+import ida_range
+import ida_funcs
+import ida_name
 import ida_hexrays
 import ida_kernwin
+import ida_idaapi
 import ida_dbg
 import ida_nalt
 
@@ -70,6 +61,7 @@ from idaapi import PluginForm
 
 # get PYTHON_PATH settings, based on platform
 PYTHON_PATH = rsconfig.get_python_interpreter()
+os.environ['PYTHON_PATH'] = PYTHON_PATH
 
 # default value is current script's path
 BROKER_PATH = os.path.join(os.path.normpath(os.path.dirname(__file__)), rsconfig.PLUGIN_DIR, 'broker.py')
@@ -77,7 +69,7 @@ if not os.path.exists(BROKER_PATH):
     rs_log("[-] broker path is not properly set, current value: <%s>" % BROKER_PATH)
     raise RuntimeError
 
-IDB_PATH = os.path.dirname(os.path.realpath(idaapi.get_path(idaapi.PATH_TYPE_IDB)))
+os.environ['IDB_PATH'] = os.path.dirname(os.path.realpath(idaapi.get_path(idaapi.PATH_TYPE_IDB)))
 
 COL_CBTRACE = rsconfig.COL_CBTRACE
 
@@ -141,9 +133,9 @@ class RequestHandler(object):
 
     # check if address is within a valid segment
     def is_safe(self, offset):
-        return not (idc.get_segm_start(offset) == idaapi.BADADDR)
+        return not (idc.get_segm_start(offset) == ida_idaapi.BADADDR)
 
-    # rebase address with respect to local image base
+    # rebase (and update) address with respect to local image base
     def rebase(self, base, offset):
         if base is not None:
             # check for non-compliant debugger client
@@ -151,16 +143,22 @@ class RequestHandler(object):
                 rs_log('unsafe addr: 0x%x > 0x%x' % (base, offset))
                 return None
 
-            if not (self.base == base):
-                offset = (offset - base) + self.base
-
             # update base address of remote module
             if self.base_remote != base:
                 self.base_remote = base
 
+            offset = self.rebase_local(offset)
+
         if not self.is_safe(offset):
             rs_log('unsafe addr: 0x%x not in valid segment' % (offset))
             return None
+
+        return offset
+
+    # rebase address with respect to local image base
+    def rebase_local(self, offset):
+        if not (self.base == self.base_remote):
+            offset = (offset - self.base_remote) + self.base
 
         return offset
 
@@ -190,8 +188,8 @@ class RequestHandler(object):
     def append_cmt(self, ea, cmt, rptble=False):
         if len(cmt) > 1024:
             rs_log("warning, comment needs to be splitted (from 0x%x)" % ea)
-            nh = idaapi.next_head(ea, idaapi.BADADDR)
-            if nh == idaapi.BADADDR:
+            nh = idaapi.next_head(ea, ida_idaapi.BADADDR)
+            if nh == ida_idaapi.BADADDR:
                 rs_log('[x] failed to find next instruction candidate')
                 return
 
@@ -216,6 +214,11 @@ class RequestHandler(object):
 
         if self.hexsync.enabled:
             self.hexsync.cb_loc(ea)
+
+    # set remote base on purpose
+    def req_rbase(self, hash):
+        rbase = hash['rbase']
+        self.base_remote = rbase
 
     # log command output request at addr
     def req_cmd(self, hash):
@@ -303,37 +306,38 @@ class RequestHandler(object):
     # patch memory at specified address using info from debugger
     def req_patch(self, hash):
         addr, value, length = hash['addr'], hash['value'], hash['len']
-        if length != 4 and length != 8:
-            rs_log("[x] unsupported length: %d" % length)
-            return
 
         if length == 4:
-            prev_value = Dword(addr)
-            if MakeDword(addr) != 1:
-                rs_log('[x] MakeDword failed')
-            if PatchDword(addr, value) != 1:
-                rs_log('[x] PatchDword failed')
+            prev_value = idc.get_wide_dword(addr)
+            if not ida_bytes.create_data(ea, FF_DWORD, 4, ida_idaapi.BADADDR):
+                rs_log('[x] ida_bytes.create_data FF_DWORD failed')
+            if not ida_bytes.patch_dword(addr, value):
+                rs_log('[x] patch_dword failed')
             if not idc.op_plain_offset(addr, 0, 0):
                 rs_log('[x] op_plain_offset failed')
 
         elif length == 8:
-            prev_value = Qword(addr)
-            if MakeQword(addr) != 1:
-                rs_log('[x] MakeQword failed')
-            if PatchQword(addr, value) != 1:
-                rs_log('[x] PatchQword failed')
+            prev_value = idc.get_qword(addr)
+            if not ida_bytes.create_data(addr, FF_QWORD, 8, ida_idaapi.BADADDR):
+                rs_log('[x] ida_bytes.create_data FF_QWORD failed')
+            if not ida_bytes.patch_qword(addr, value):
+                rs_log('[x] patch_qword failed')
             if not idc.op_plain_offset(addr, 0, 0):
                 rs_log('[x] op_plain_offset failed')
+
+        else:
+            rs_log("[x] unsupported length: %d" % length)
+            return
 
         rs_log("patched 0x%x = 0x%x (previous was 0x%x)" % (addr, value, prev_value))
 
     # return idb's symbol for a given address
     def req_rln(self, hash):
-        raddr, rbase, offset, base = hash['raddr'], hash['rbase'], hash['offset'], hash['base']
+        raddr = hash['raddr']
 
-        rs_debug("rln: 0x%x -  0x%x - 0x%x - 0x%x" % (raddr, rbase, offset, base))
+        rs_debug("rln: 0x%x" % raddr)
 
-        addr = self.rebase(rbase, raddr)
+        addr = self.rebase_local(raddr)
         if not addr:
             rs_log("could not rebase this address (0x%x)" % raddr)
             return
@@ -347,9 +351,13 @@ class RequestHandler(object):
                 return
 
             lck = idaapi.lock_func(func)
+            limits = ida_range.range_t()
+            rs = ida_range.rangeset_t()
 
-            limits = idaapi.range_t()
-            if idaapi.get_func_limits(func, limits):
+            if ida_funcs.get_func_ranges(rs, func) != ida_idaapi.BADADDR:
+                limits.start_ea = rs.begin().start_ea
+                limits.end_ea = rs.begin().end_ea
+
                 if limits.start_ea != addr:
                     if (addr > limits.start_ea):
                         sym = "%s%s0x%x" % (sym, "+", addr - limits.start_ea)
@@ -369,16 +377,16 @@ class RequestHandler(object):
 
     # return address for a given idb's symbol
     def req_rrln(self, hash):
-        sym, rbase, offset, base = hash['sym'], hash['rbase'], hash['offset'], hash['base']
+        sym = hash['sym']
+        rs_log("rrln> symbol \"%s\"" % sym)
 
-        rs_log("%s -  0x%x - 0x%x - 0x%x" % (sym, rbase, offset, base))
-
-        addr = idc.get_name_ea_simple(sym)
+        addr = idc.get_name_ea_simple(str(sym))
         if addr:
-            self.notice_broker("cmd", "\"cmd\":\"%s\"" % addr)
-            rs_log("resolved address: %s" % addr)
+            raddr = self.rebase_remote(addr)
+            self.notice_broker("cmd", "\"cmd\":\"%s\"" % raddr)
+            rs_log("rrln> remote: 0x%x, local: 0x%x)" % (raddr, addr))
         else:
-            rs_log("could not resolve address for symbol %s" % sym)
+            rs_log("rrln> symbol not found \"%s\"" % sym)
 
     # add label request at addr
     def req_lbl(self, hash):
@@ -477,7 +485,7 @@ class RequestHandler(object):
 
         if md5:
             rs_log("modcheck idb (md5)")
-            local = rs_decode(idaapi.retrieve_input_file_md5())
+            local = rs_decode(binascii.hexlify(idaapi.retrieve_input_file_md5())).upper()
             remote = (''.join(md5.split())).upper()
         elif pdb:
             rs_log("modcheck idb (pdb guid)")
@@ -491,7 +499,7 @@ class RequestHandler(object):
         if remote == '0':
             output = '[!] warning, no Debug Directory'
         elif local == remote:
-            output = 'module successfully matched'
+            output = '[+] module successfully matched'
         else:
             output = '[!] warning, modules mismatch'
 
@@ -521,7 +529,7 @@ class RequestHandler(object):
         elif(subtype == 'notice'):
             # notice from broker
             self.broker_port = int(hash['port'])
-            rs_log("<< broker << listening on port %d" % self.broker_port)
+            rs_debug("<< broker << binding on port %d" % self.broker_port)
 
             for attempt in range(rsconfig.CONNECT_BROKER_MAX_ATTEMPT):
                 try:
@@ -540,6 +548,10 @@ class RequestHandler(object):
                     if (attempt == (rsconfig.CONNECT_BROKER_MAX_ATTEMPT - 1)):
                         self.announcement("[sync] failed to connect to broker (attempt %d)" % attempt)
                         raise RuntimeError
+
+            # request broker to validate its beacon
+            time.sleep(0.4)
+            self.beacon_notice()
 
         # enable/disable idb, if disable it drops most sync requests
         elif(subtype == 'enable_idb'):
@@ -613,6 +625,10 @@ class RequestHandler(object):
     # send a kill notice to the broker (then forwarded to the dispatcher)
     def kill_notice(self):
         self.notice_broker("kill")
+
+    # send a beacon notice to the broker
+    def beacon_notice(self):
+        self.notice_broker('beacon')
 
     # send a bp command (F2) to the debugger (via the broker and dispatcher)
     def bp_notice(self, oneshot=False):
@@ -688,36 +704,29 @@ class RequestHandler(object):
         ea = idaapi.get_screen_ea()
         mod = self.name.split('.')[0].strip()
         cmd = self.dbg_dialect['prefix'] + "translate 0x%x 0x%x %s" % (self.base, ea, mod)
-
         self.notice_broker("cmd", "\"cmd\":\"%s\"" % cmd)
-        rs_log("translate address 0x%x" % ea)
+        rs_debug("translate address 0x%x" % ea)
+
+    # send a command to the debugger (via the broker and dispatcher)
+    def cmd_notice(self, cmd, descr):
+        if not self.is_active:
+            rs_log("idb isn't enabled, can't %s" % descr)
+            return
+
+        self.notice_broker("cmd", "\"cmd\":\"%s\"" % self.dbg_dialect[cmd])
+        self.notice_anti_flood()
 
     # send a go command (Alt-F5) to the debugger (via the broker and dispatcher)
     def go_notice(self):
-        if not self.is_active:
-            rs_log("idb isn't enabled, can't go")
-            return
-
-        self.notice_broker("cmd", "\"cmd\":\"%s\"" % self.dbg_dialect['go'])
-        self.notice_anti_flood()
+        self.cmd_notice('go', descr='go')
 
     # send a single trace command (F11) to the debugger (via the broker and dispatcher)
     def si_notice(self):
-        if not self.is_active:
-            rs_log("idb isn't enabled, can't trace")
-            return
-
-        self.notice_broker("cmd", "\"cmd\":\"%s\"" % self.dbg_dialect['si'])
-        self.notice_anti_flood()
+        self.cmd_notice('si', descr='trace')
 
     # send a single step command (F10) to the debugger (via the broker and dispatcher)
     def so_notice(self):
-        if not self.is_active:
-            rs_log("idb isn't enabled, can't single step")
-            return
-
-        self.notice_broker("cmd", "\"cmd\":\"%s\"" % self.dbg_dialect['so'])
-        self.notice_anti_flood()
+        self.cmd_notice('so', descr='step')
 
     # send a notice message to the broker process
     def notice_broker(self, type, args=None):
@@ -766,6 +775,7 @@ class RequestHandler(object):
             'rcmt': self.req_rcmt,
             'fcmt': self.req_fcmt,
             'raddr': self.req_raddr,
+            'rbase': self.req_rbase,
             'cursor': self.req_cursor,
             'patch': self.req_patch,
             'rln': self.req_rln,
@@ -832,6 +842,7 @@ class DbgDirHlpr(object):
 
         return guid
 
+    @staticmethod
     def read_rsds_pdb():
         penode = idaapi.netnode()
         PE_SUPSTR_PDBNM = idautils.peutils_t.PE_ALT_DBG_FPOS - 8
@@ -954,21 +965,20 @@ class SyncForm_t(PluginForm):
     def init_broker(self):
         rs_debug("init_broker")
         modname = self.input.text()
+        if modname == "":
+            modname = self.handle_name_aliasing()
+            self.input.setText(modname)
+
         cmdline = "\"%s\" -u \"%s\" --idb \"%s\"" % (
                   PYTHON_PATH,
                   BROKER_PATH,
                   modname)
         rs_log("cmdline: %s" % cmdline)
 
-        self.broker = Broker(self.parser)
-        env = QProcessEnvironment.systemEnvironment()
-        env.insert("IDB_PATH", IDB_PATH)
-        env.insert("PYTHON_PATH", PYTHON_PATH)
-
         try:
+            self.broker = Broker(self.parser)
             self.broker.started.connect(self.cb_broker_started)
             self.broker.finished.connect(self.cb_broker_finished)
-            self.broker.setProcessEnvironment(env)
             self.broker.start(cmdline)
         except Exception as e:
             rs_log("[-] failed to start broker: %s\n%s" % (str(e), traceback.format_exc()))
@@ -1080,31 +1090,20 @@ class SyncForm_t(PluginForm):
             rs_log("hint: pdb name ('%s') differs from registered module name ('%s')" % (pdb_root+mod_ext, name))
 
     # discover the name used to expose the idb, default is from get_root_filename
-    # may be alias with '.sync' conf file, local or from user's home
+    # alias can be defined in '.sync' configuration file
     def handle_name_aliasing(self):
         name = idaapi.get_root_filename()
         rs_log("default idb name: %s" % name)
 
-        # check in conf for name aliasing
-        os.environ['IDB_PATH'] = os.path.realpath(IDB_PATH)
-        for loc in ('IDB_PATH', 'USERPROFILE', 'HOME'):
-            if loc in os.environ:
-                try:
-                    confpath = os.path.join(os.path.realpath(os.environ[loc]), '.sync')
-                    if os.path.exists(confpath):
-                        rs_log("found config file: %s" % confpath)
-                        config = SafeConfigParser()
-                        config.read(confpath)
-
-                        if config.has_option('ALIASES', name):
-                            alias = config.get('ALIASES', name)
-                            if alias != "":
-                                name = alias
-                                rs_log("overwrite idb name with %s" % name)
-
-                        break
-                except Exception as e:
-                    err_log('failed to load configuration file')
+        try:
+            conf = load_configuration(name)
+            if conf.path:
+                rs_log("found config file: %s" % repr(conf))
+            if conf.alias:
+                name = conf.alias
+                rs_log("overwrite idb name with %s" % name)
+        except Exception as e:
+            rs_log('failed to load configuration file')
 
         self.pdb_name_warning(name)
         return name
@@ -1202,6 +1201,7 @@ class SyncForm_t(PluginForm):
 
         global SyncForm
         del SyncForm
+        SyncForm = None
 
     def Show(self):
         return PluginForm.Show(self, "ret-sync", options=PluginForm.WOPN_PERSIST)
@@ -1216,6 +1216,8 @@ class RetSyncPlugin(idaapi.plugin_t):
     help = 'Synchronize a debugging session with IDA.'
     wanted_name = 'ret-sync'
     wanted_hotkey = 'Alt-Shift-S'
+    global SyncForm
+    SyncForm = None
 
     def init(self):
         return idaapi.PLUGIN_KEEP
@@ -1229,9 +1231,10 @@ class RetSyncPlugin(idaapi.plugin_t):
             return
 
         global SyncForm
-        SyncForm = SyncForm_t()
-        SyncForm.Show()
-        rs_log("plugin loaded")
+        if not SyncForm:
+            SyncForm = SyncForm_t()
+            SyncForm.Show()
+            rs_log("plugin loaded")
 
 
 def PLUGIN_ENTRY():

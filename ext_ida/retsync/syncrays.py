@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2018-2019, Alexandre Gazet.
+# Copyright (C) 2018-2020, Alexandre Gazet.
 #
 # This file is part of ret-sync.
 #
@@ -103,7 +103,12 @@ class Syncrays(object):
 
         if self.last_func != func.start_ea:
             self.vdui_t = ida_hexrays.open_pseudocode(ea, 0)
+            if not self.vdui_t:
+                return
             self.cfunc = self.vdui_t.cfunc
+            if not self.cfunc:
+                # may happen in case of decompilation error
+                return
             self.eamap = self.cfunc.get_eamap()
             self.prev_ea = None
             self.last_func = func.start_ea

@@ -41,7 +41,6 @@ import ghidra.app.cmd.comments.AppendCommentCmd;
 import ghidra.app.cmd.comments.SetCommentCmd;
 import ghidra.app.cmd.function.SetFunctionRepeatableCommentCmd;
 import ghidra.app.cmd.label.AddLabelCmd;
-import ghidra.app.decompiler.component.DecompilerHighlightService;
 import ghidra.app.events.ProgramActivatedPluginEvent;
 import ghidra.app.events.ProgramClosedPluginEvent;
 import ghidra.app.plugin.PluginCategoryNames;
@@ -76,8 +75,7 @@ import ghidra.program.util.ProgramLocation;
                 ProgramManager.class,
                 ConsoleService.class,
                 CodeViewerService.class,
-                GoToService.class,
-                DecompilerHighlightService.class},
+                GoToService.class },
         eventsConsumed = {
                 ProgramActivatedPluginEvent.class,
                 ProgramClosedPluginEvent.class }
@@ -93,7 +91,6 @@ public class RetSyncPlugin extends ProgramPlugin {
     CodeViewerService cvs;
     ProgramManager pm;
     LocalColorizerService clrs;
-    DecompilerHighlightService dhs;
 
     // client handling
     ListenerBackground server;
@@ -119,6 +116,7 @@ public class RetSyncPlugin extends ProgramPlugin {
     protected String SYNC_HOST = SYNC_HOST_DEFAULT;
     protected int SYNC_PORT = SYNC_PORT_DEFAULT;
     protected HashMap<String, String> aliases = new HashMap<String, String>();
+    protected boolean bUseEnhancedHighlight = true;
 
     public RetSyncPlugin(PluginTool tool) {
         super(tool, true, true);
@@ -136,7 +134,6 @@ public class RetSyncPlugin extends ProgramPlugin {
         gs = tool.getService(GoToService.class);
         pm = tool.getService(ProgramManager.class);
         cvs = tool.getService(CodeViewerService.class);
-        dhs = tool.getService(DecompilerHighlightService.class);
         clrs = new LocalColorizerService(this);
 
         loadConfiguration();
@@ -320,6 +317,13 @@ public class RetSyncPlugin extends ProgramPlugin {
                 }
             }
 
+            Section secGhidra = config.get("GHIDRA");
+            if (secGhidra != null) {
+                boolean enhanced_highlight = Boolean.valueOf(secGhidra.getOrDefault("enhanced_highlight", "true"));
+                cs.println(String.format("  - enhanced highlight: %s", enhanced_highlight));
+                bUseEnhancedHighlight = enhanced_highlight;
+            }
+
             found = true;
         } catch (IOException e) {
             cs.println(String.format("[>] failed to parse conf file: %s", e.getMessage()));
@@ -332,39 +336,54 @@ public class RetSyncPlugin extends ProgramPlugin {
         moduleBaseRemote = bases;
     }
 
+    void setRemoteBase(long rbase) {
+        imageBaseRemote = imageBaseLocal.getNewAddress(rbase);
+    }
+
     boolean isRemoteBaseKnown() {
         return imageBaseRemote != null;
     }
 
+    // compare remote image base with offset
+    int cmpRemoteBase(long rbase) {
+        return imageBaseRemote.compareTo(imageBaseRemote.getNewAddress(rbase));
+    }
+
     // rebase remote address with respect to
-    // current program image base
+    // current program image base and update remote base address
     Address rebase(long base, long offset) {
+        imageBaseRemote = imageBaseLocal.getNewAddress(base);
+        return rebaseLocal(imageBaseLocal.getNewAddress(offset));
+    }
+
+    // rebase remote address with respect to
+    // local program image base
+    Address rebaseLocal(Address loc) {
         Address dest;
 
         if (program == null)
             return null;
 
         try {
-            dest = imageBaseLocal.addNoWrap(offset - base);
+            dest = imageBaseLocal.addNoWrap(loc.subtract(imageBaseRemote));
         } catch (AddressOverflowException e) {
-            cs.println(String.format("[x] unsafe rebase (wrap): 0x%x - 0x%x", base, offset));
+            cs.println(String.format("[x] unsafe rebase local (wrap): %s - %s", imageBaseRemote, loc));
             return null;
         }
 
         if (!dest.getAddressSpace().isLoadedMemorySpace()) {
-            cs.println(String.format("[x] unsafe rebase: 0x%x - 0x%x", base, offset));
+            cs.println(String.format("[x] unsafe rebase local: %s", loc));
             return null;
         }
-
-        imageBaseRemote = imageBaseLocal.getNewAddress(base);
 
         return dest;
     }
 
-    // compare remote image base with
-    // offset from arg
-    int cmpRemoteBase(long rbase) {
-        return imageBaseRemote.compareTo(imageBaseRemote.getNewAddress(rbase));
+    // rebase remote address with respect to
+    // local program image base
+    // method overloading for long type
+    Address rebaseLocal(long offset) {
+        return rebaseLocal(imageBaseLocal.getNewAddress(offset));
     }
 
     // rebase local address with respect to
@@ -378,12 +397,7 @@ public class RetSyncPlugin extends ProgramPlugin {
         try {
             dest = imageBaseRemote.addNoWrap(loc.subtract(imageBaseLocal));
         } catch (AddressOverflowException e) {
-            cs.println(String.format("[x] unsafe rebase remote (wrap): 0x%x - 0x%x", imageBaseRemote, loc));
-            return null;
-        }
-
-        if (!dest.getAddressSpace().isLoadedMemorySpace()) {
-            cs.println(String.format("[x] unsafe rebase remote: 0x%x", loc.getOffset()));
+            cs.println(String.format("[x] unsafe rebase remote (wrap): %s - %s", imageBaseRemote, loc));
             return null;
         }
 
@@ -401,7 +415,6 @@ public class RetSyncPlugin extends ProgramPlugin {
         if (dest != null) {
             gs.goTo(dest);
             clrs.setPrevAddr(dest);
-            clrs.enhancedDecompHighlight(dest);
         }
     }
 
@@ -495,40 +508,43 @@ public class RetSyncPlugin extends ProgramPlugin {
         return res;
     }
 
-    String getSymAt(long base, long offset) {
-        Address dest = null;
+    String getSymAt(Address symAddr) {
         String symName = null;
+
+        if (symAddr == null) {
+            cs.println(String.format("[x] failed to get symbol at null address"));
+            return null;
+        }
+
         SymbolTable symTable = program.getSymbolTable();
 
-        dest = rebase(base, offset);
-        if (dest != null) {
-            // look for 'first-hand' symbol (function name, label, etc.)
-            Symbol sym = symTable.getPrimarySymbol(dest);
-            if (sym != null) {
-                symName = sym.getName();
-            }
+        // look for 'first-hand' symbol (function name, label, etc.)
+        Symbol sym = symTable.getPrimarySymbol(symAddr);
+        if (sym != null) {
+            symName = sym.getName();
+            cs.println(String.format("[>] solved primary sym %s@%s", symName, symAddr));
+        }
 
-            // return offset with respect to function's entry point
-            if (symName == null) {
-                FunctionManager fm = program.getFunctionManager();
-                Function fn = fm.getFunctionContaining(dest);
+        // return offset with respect to function's entry point
+        if (symName == null) {
+            FunctionManager fm = program.getFunctionManager();
+            Function fn = fm.getFunctionContaining(symAddr);
 
-                if (fn != null) {
-                    Address ep = fn.getEntryPoint();
-                    if (dest.compareTo(ep) > 0) {
-                        symName = String.format("%s+0x%x", fn.getName(), dest.subtract(ep));
-                    } else {
-                        symName = String.format("%s-0x%x", fn.getName(), ep.subtract(dest));
-                    }
+            if (fn != null) {
+                Address ep = fn.getEntryPoint();
+                if (symAddr.compareTo(ep) > 0) {
+                    symName = String.format("%s+0x%x", fn.getName(), symAddr.subtract(ep));
+                } else {
+                    symName = String.format("%s-0x%x", fn.getName(), ep.subtract(symAddr));
                 }
-            }
-
-            if (symName != null) {
-                cs.println(String.format("[>] solved sym %s @ 0x%x", symName, dest.getOffset()));
-            } else {
-                cs.println(String.format("[sync] failed to get symbol at 0x%x", dest.getOffset()));
+                cs.println(String.format("[>] solved sym %s@%s", symName, symAddr));
             }
         }
+
+        if (symName == null) {
+            cs.println(String.format("[sync] failed to get symbol at %s", symAddr));
+        }
+
         return symName;
     }
 
